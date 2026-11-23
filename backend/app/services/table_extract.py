@@ -62,13 +62,25 @@ class TableExtractService(BaseModuleService):
             })
 
         output_path = self._data_dir("tables") / f"{layout_id}_tables.jsonl"
-        written = self._write_jsonl(output_path, extracted)
+        # 按表格编号合并：本次重算的表格覆盖同名记录，其他页的表格区域原样保留，
+        # 避免版式局部补跑把同一张表重复追加进产物。
+        merged: dict[str, dict[str, Any]] = {}
+        for record in self._read_jsonl(output_path):
+            merged[str(record.get("table_key") or f"{record.get('page')}:{record.get('bbox')}")] = record
+        for record in extracted:
+            merged[record["table_key"]] = record
+        ordered = sorted(
+            merged.values(),
+            key=lambda r: (int(r.get("page") or 0), str(r.get("table_key", ""))),
+        )
+        written = self._replace_jsonl(output_path, ordered)
 # 数据产物：表格结构化数据集写入tables目录持久化文件
 
         # 写入检查点
         self._write_checkpoint(f"table_{layout_id}", {
             "layout_id": layout_id,
             "tables_extracted": len(extracted),
+            "tables_total": len(ordered),
             "total_cells": sum(e["rows"] * e["cols"] for e in extracted),
             "columns_per_table": [e["cols"] for e in extracted],
         })
@@ -76,6 +88,7 @@ class TableExtractService(BaseModuleService):
         return {
             "layout_id": layout_id,
             "tables_extracted": len(extracted),
+            "tables_total": len(ordered),
             "records_written": written,
             "output": str(output_path),
             "total_cells": sum(e["rows"] * e["cols"] for e in extracted),

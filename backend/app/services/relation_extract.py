@@ -102,7 +102,8 @@ class RelationExtractService(BaseModuleService):
         relations = self._deduplicate_relations(relations)
 
         output_path = self._data_dir("relations") / f"{entity_set_id}_relations.jsonl"
-        written = self._write_jsonl(output_path, relations)
+        # 关系产物按整篇重算，整体替换避免重复补跑把同一批记录追加成多份
+        written = self._replace_jsonl(output_path, relations)
 
         # 写入检查点
         self._write_checkpoint(f"relation_{entity_set_id}", {

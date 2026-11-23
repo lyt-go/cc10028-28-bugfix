@@ -424,3 +424,205 @@ class TestDataQuality:
         parse_svc.execute_parse(task["id"])
         cp_file = DATA_ROOT / "checkpoints" / f"parse_{doc_id}.json"
         assert cp_file.exists(), f"检查点文件 {cp_file} 应存在"
+
+class TestLocalParseCorrection:
+    """局部补跑：范围解析、页组确认与版式还原变动页消费"""
+
+    def _task(self, svc, doc_id, page_range):
+        task, _ = svc.create_entry({
+            "任务编号": _uid("PR"), "文档编号": doc_id, "解析器类型": "PDF",
+            "页码范围": page_range, "解析模式": "full", "输出格式": "jsonl",
+            "超时秒数": "300", "解析器版本": "v2.1.0",
+        })
+        return task
+
+    def test_page_range_parser(self):
+        svc = FormatParseService()
+        assert svc._parse_page_numbers("", 3) == [1, 2, 3]
+        assert svc._parse_page_numbers("2-2", 3) == [2]
+        assert svc._parse_page_numbers("1-3,2", 3) == [1, 2, 3]
+        # 超出真实页数的终点截到末页，不会虚增完成页
+        assert svc._parse_page_numbers("2-99", 3) == [2, 3]
+        with pytest.raises(ValueError):
+            svc._parse_page_numbers("5-6", 3)
+        with pytest.raises(ValueError):
+            svc._parse_page_numbers("3-1", 3)
+        with pytest.raises(ValueError):
+            svc._parse_page_numbers("abc", 3)
+
+    def test_local_run_only_writes_scope_pages(self):
+        doc_id = _uid("DD")
+        svc = FormatParseService()
+        full = svc.execute_parse(self._task(svc, doc_id, "" )["id"])
+        assert "error" not in full, full.get("error")
+        correction = svc.execute_parse(self._task(svc, doc_id, "2-2")["id"])
+        assert "error" not in correction, correction.get("error")
+        # 本次产物页码只有第 2 页，不把范围外的页算成本次完成页数
+        assert correction["page_numbers"] == [2]
+        assert correction["pages"] == 1
+        # 合并后的整篇页组仍是 1-3，且没有重复页
+        assert correction["merged_pages"] == [1, 2, 3]
+        on_disk = svc._read_jsonl(DATA_ROOT / "parsed" / f"{doc_id}_parsed.jsonl")
+        assert [r["page_num"] for r in on_disk] == [1, 2, 3]
+        # 第 1、3 页保留全量解析的来源，只有第 2 页换成新页组
+        runs = {r["page_num"]: r["parse_run"] for r in on_disk}
+        assert runs[1] == full["run_id"]
+        assert runs[3] == full["run_id"]
+        assert runs[2] == correction["run_id"]
+
+    def test_page_group_records_confirmed_scope(self):
+        doc_id = _uid("DD")
+        svc = FormatParseService()
+        svc.execute_parse(self._task(svc, doc_id, "")["id"])
+        correction = svc.execute_parse(self._task(svc, doc_id, "2-2")["id"])
+        group = svc._read_json(svc._page_group_path(doc_id))
+        assert group["run_id"] == correction["run_id"]
+        assert group["scope_pages"] == [2]
+        assert group["pages"] and all(p["page"] == 2 for p in group["pages"])
+        assert group["merged_pages"] == [1, 2, 3]
+        assert group["confirmed"] is True
+        assert group["confirmed_pages"] == [2]
+
+    def test_layout_consumes_page_group_and_keeps_old_pages(self):
+        doc_id = _uid("DD")
+        parse_svc = FormatParseService()
+        full = parse_svc.execute_parse(self._task(parse_svc, doc_id, "")["id"])
+        layout_svc = LayoutRestoreService()
+        before = {r["page"]: r for r in layout_svc._read_jsonl(DATA_ROOT / "layout" / f"{doc_id}_layout.jsonl")}
+        assert sorted(before) == [1, 2, 3]
+
+        correction = parse_svc.execute_parse(self._task(parse_svc, doc_id, "2-2")["id"])
+        assert "error" not in correction, correction.get("error")
+        after = {r["page"]: r for r in layout_svc._read_jsonl(DATA_ROOT / "layout" / f"{doc_id}_layout.jsonl")}
+        assert sorted(after) == [1, 2, 3]
+        # 只有更正页换成新页组，其他页沿用旧版式记录
+        assert after[2]["parse_run"] == correction["run_id"]
+        assert after[1]["parse_run"] == full["run_id"]
+        assert after[3]["parse_run"] == full["run_id"]
+        assert after[1]["version"] == before[1]["version"]
+        assert after[3]["table_bboxes"] == before[3]["table_bboxes"]
+
+        layout_group = layout_svc._read_json(layout_svc._data_dir("page_groups") / f"{doc_id}_layout_group.json")
+        assert layout_group["scope_pages"] == [2]
+        assert layout_group["pages_restored"] == [2]
+        assert layout_group["carried_pages"] == [1, 3]
+        assert layout_group["confirmed"] is True
+
+        cp = layout_svc._read_checkpoint(f"layout_{doc_id}")
+        assert cp["restored_pages"] == [2]
+
+    def test_layout_direct_call_with_page_group(self):
+        doc_id = _uid("DD")
+        parse_svc = FormatParseService()
+        parse_svc.execute_parse(self._task(parse_svc, doc_id, "")["id"])
+        correction = parse_svc.execute_parse(self._task(parse_svc, doc_id, "2-2")["id"])
+        group = parse_svc._read_json(parse_svc._page_group_path(doc_id))
+        # 版式还原被单独调用时读取已确认解析页组，只处理变动页
+        result = LayoutRestoreService().restore_from_document(doc_id, page_group=group)
+        assert "error" not in result, result.get("error")
+        assert result["pages_restored"] == [2]
+        assert result["carried_pages"] == [1, 3]
+        assert result["pages"] == 3
+
+    def test_layout_scope_mismatch_is_rejected(self):
+        doc_id = _uid("DD")
+        parse_svc = FormatParseService()
+        parse_svc.execute_parse(self._task(parse_svc, doc_id, "")["id"])
+        group = parse_svc._read_json(parse_svc._page_group_path(doc_id))
+        bad_group = dict(group, scope_pages=[2, 9], pages=[{"page": 2}, {"page": 9}], run_id="PG-BAD")
+        result = LayoutRestoreService().restore_from_document(doc_id, page_group=bad_group)
+        assert "error" in result, "页组含不存在的页时应拒绝还原"
+        # 失败时不能留下半套版式
+        layout_pages = [r["page"] for r in LayoutRestoreService()._read_jsonl(
+            DATA_ROOT / "layout" / f"{doc_id}_layout.jsonl")]
+        assert layout_pages == [1, 2, 3]
+
+    def test_local_run_without_full_history_is_refused(self):
+        doc_id = _uid("DD")
+        svc = FormatParseService()
+        result = svc.execute_parse(self._task(svc, doc_id, "2-2")["id"])
+        assert "error" in result
+        assert "全量解析" in result["error"]
+        parsed_file = DATA_ROOT / "parsed" / f"{doc_id}_parsed.jsonl"
+        assert not parsed_file.exists(), "缺全量结果时不得落盘半次产物"
+
+    def test_out_of_range_end_clamped_not_counted(self):
+        doc_id = _uid("DD")
+        svc = FormatParseService()
+        full = svc.execute_parse(self._task(svc, doc_id, "")["id"])
+        result = svc.execute_parse(self._task(svc, doc_id, "2-99")["id"])
+        assert "error" not in result, result.get("error")
+        # 范围外页码不计入完成页数，只完成真实的 2-3 页
+        assert result["page_numbers"] == [2, 3]
+        assert result["pages"] == 2
+        assert result["merged_pages"] == [1, 2, 3]
+        runs = {r["page_num"]: r["parse_run"] for r in svc._read_jsonl(
+            DATA_ROOT / "parsed" / f"{doc_id}_parsed.jsonl")}
+        assert runs[1] == full["run_id"]
+
+    def test_rerun_same_page_is_idempotent(self):
+        doc_id = _uid("DD")
+        svc = FormatParseService()
+        svc.execute_parse(self._task(svc, doc_id, "")["id"])
+        first = svc.execute_parse(self._task(svc, doc_id, "2-2")["id"])
+        second = svc.execute_parse(self._task(svc, doc_id, "2-2")["id"])
+        pages = [r["page_num"] for r in svc._read_jsonl(DATA_ROOT / "parsed" / f"{doc_id}_parsed.jsonl")]
+        assert pages == [1, 2, 3]
+        layout_pages = [r["page"] for r in LayoutRestoreService()._read_jsonl(
+            DATA_ROOT / "layout" / f"{doc_id}_layout.jsonl")]
+        assert layout_pages == [1, 2, 3]
+        runs = {r["page"]: r["parse_run"] for r in LayoutRestoreService()._read_jsonl(
+            DATA_ROOT / "layout" / f"{doc_id}_layout.jsonl")}
+        assert runs[2] == second["run_id"] and runs[2] != first["run_id"]
+
+
+class TestStalePageGroup:
+    """旧页组不能代表当前版式"""
+
+    def _task(self, svc, doc_id, page_range=""):
+        task, _ = svc.create_entry({
+            "任务编号": _uid("PR"), "文档编号": doc_id, "解析器类型": "PDF",
+            "页码范围": page_range,
+        })
+        return task
+
+    def test_stale_group_rejected(self):
+        doc_id = _uid("DD")
+        svc = FormatParseService()
+        first = svc.execute_parse(self._task(svc, doc_id)["id"])
+        stale = svc._read_json(svc._page_group_path(doc_id))
+        # 又一次补跑改写第 2 页后，旧页组不再代表当前产物
+        svc.execute_parse(self._task(svc, doc_id, "2-2")["id"])
+        result = LayoutRestoreService().restore_from_document(doc_id, page_group=stale)
+        assert "error" in result, "过期页组不得用于版式还原"
+        assert stale["run_id"] == first["run_id"]
+
+
+class TestDownstreamIdempotency:
+    """局部补跑下游产物不重复堆积"""
+
+    def _run(self, svc, doc_id, page_range, tag):
+        task, _ = svc.create_entry({
+            "任务编号": tag, "文档编号": doc_id, "解析器类型": "PDF",
+            "页码范围": page_range,
+        })
+        return svc.execute_parse(task["id"])
+
+    def test_table_and_ocr_not_duplicated(self):
+        doc_id = _uid("DD")
+        parse_svc = FormatParseService()
+        self._run(parse_svc, doc_id, "", _uid("PR"))
+        self._run(parse_svc, doc_id, "2-2", _uid("PR"))
+        table_rows = parse_svc._read_jsonl(DATA_ROOT / "tables" / f"{doc_id}_tables.jsonl")
+        assert [(r["page"], r["doc_id"]) for r in table_rows] == [(1, doc_id), (3, doc_id)]
+        ocr_rows = parse_svc._read_jsonl(DATA_ROOT / "ocr" / f"{doc_id}_ocr.jsonl")
+        assert [(r["image_area"], r["bbox"]) for r in ocr_rows] == [(2, "(10, 9, 160, 159)")]
+
+    def test_regions_carry_real_doc_id(self):
+        doc_id = _uid("DD")
+        parse_svc = FormatParseService()
+        self._run(parse_svc, doc_id, "", _uid("PR"))
+        tables = parse_svc._read_jsonl(DATA_ROOT / "layout" / f"{doc_id}_tables.jsonl")
+        images = parse_svc._read_jsonl(DATA_ROOT / "layout" / f"{doc_id}_images.jsonl")
+        assert tables and all(t["doc_id"] == doc_id for t in tables)
+        assert images and all(i["doc_id"] == doc_id for i in images)

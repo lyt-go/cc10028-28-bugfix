@@ -51,7 +51,8 @@ class KgBuildService(BaseModuleService):
         triples = self._deduplicate_triples(triples)
 
         output_path = self._data_dir("graph") / f"{relation_set_id}_graph.jsonl"
-        written = self._write_jsonl(output_path, triples)
+        # 图谱三元组按整篇重算，整体替换避免重复补跑把同一批记录追加成多份
+        written = self._replace_jsonl(output_path, triples)
 
         # 生成图谱边和节点的统计
         nodes = set()

@@ -36,17 +36,17 @@ class ExtractQualityService(BaseModuleService):
 
         for ef in entity_files:
             entities = self._read_jsonl(ef)
-            sample_size = max(1, int(len(entities) * sample_ratio))
+            sample_size = max(1, round(len(entities) * sample_ratio))
             total_entities += sample_size
-            # 抽样质检：模拟95%准确率
-            correct = int(sample_size * 0.95)
+            # 抽样质检：模拟95%准确率，单个抽样条目按四舍五入计入正确数，避免小样本恒为0
+            correct = round(sample_size * 0.95)
             correct_entities += correct
 
         for rf in relation_files:
             relations = self._read_jsonl(rf)
-            sample_size = max(1, int(len(relations) * sample_ratio))
+            sample_size = max(1, round(len(relations) * sample_ratio))
             total_relations += sample_size
-            correct = int(sample_size * 0.88)
+            correct = round(sample_size * 0.88)
             correct_relations += correct
 
         if total_entities == 0 and total_relations == 0:

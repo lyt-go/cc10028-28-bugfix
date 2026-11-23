@@ -98,7 +98,8 @@ class ChunkSplitService(BaseModuleService):
                 })
 
         output_path = self._data_dir("chunks") / f"{parsed_doc_id}_chunks.jsonl"
-        written = self._write_jsonl(output_path, chunks)
+        # 分块产物按整篇重算，整体替换避免重复补跑把同一批记录追加成多份
+        written = self._replace_jsonl(output_path, chunks)
 
         # 写入检查点
         self._write_checkpoint(f"chunk_{parsed_doc_id}", {

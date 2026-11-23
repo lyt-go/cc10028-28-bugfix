@@ -64,7 +64,14 @@ class OcrEngineService(BaseModuleService):
 
         output_path = self._data_dir("ocr") / f"{image_area_id}_ocr.jsonl"
 # 数据产物：OCR识别结果数据写入ocr目录持久化文件
-        written = self._write_jsonl(output_path, recognized)
+        # 按页码+bbox合并：版式局部补跑重复触发时覆盖同一区域，其他区域原样保留
+        merged: dict[tuple[Any, Any], dict[str, Any]] = {}
+        for record in self._read_jsonl(output_path):
+            merged[(record.get("image_area"), record.get("bbox"))] = record
+        for record in recognized:
+            merged[(record.get("image_area"), record.get("bbox"))] = record
+        ordered = sorted(merged.values(), key=lambda r: (int(r.get("image_area") or 0), str(r.get("bbox", ""))))
+        written = self._replace_jsonl(output_path, ordered)
 
         # 写入检查点
         self._write_checkpoint(f"ocr_{image_area_id}", {

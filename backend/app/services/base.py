@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import hashlib
 import time
 import importlib
@@ -141,6 +142,40 @@ class BaseModuleService:
                         continue
         return records
 
+    def _replace_jsonl(self, filepath: Path, records: list[dict[str, Any]]) -> int:
+        """整体替换JSONL文件内容：先写临时文件再原子改名，失败时旧文件保持完整。
+
+        局部补跑需要按页合并而不是追加重写，否则同一页会出现多份记录；
+        原子改名保证下游读到的要么是旧页组，要么是合并后的新页组。
+        """
+        _ensure_dir(filepath.parent)
+        tmp_file = filepath.with_name(filepath.name + ".tmp")
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            for rec in records:
+                f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+        os.replace(tmp_file, filepath)
+        return len(records)
+
+    def _read_json(self, filepath: Path) -> dict[str, Any] | None:
+        """读取单个JSON对象文件，不存在或内容损坏时返回None。"""
+        if not filepath.exists():
+            return None
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def _write_json(self, filepath: Path, payload: dict[str, Any]) -> Path:
+        """原子写入单个JSON对象文件，用于页组等需要整体切换的元数据。"""
+        _ensure_dir(filepath.parent)
+        tmp_file = filepath.with_name(filepath.name + ".tmp")
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
+        os.replace(tmp_file, filepath)
+        return filepath
+
     def _write_checkpoint(self, name: str, state: dict[str, Any]) -> Path:
         """写入检查点文件，用于中断恢复与游标推进。检查点记录当前处理偏移和状态。"""
 # 数据操作：存储检查点数据管理中断恢复与游标推进
@@ -158,6 +193,81 @@ class BaseModuleService:
             return None
         with open(cp_file, "r", encoding="utf-8") as f:
             return json.load(f)
+
+    # -- 页码范围与解析页组 --
+
+    @staticmethod
+    def _parse_page_numbers(raw: Any, total_pages: int) -> list[int]:
+        """把「2-2」「1-3,5」这类页码范围解析成升序页码，空值表示全量。
+
+        页码只允许落在文档真实页数内，范围外的页码直接报错，
+        避免局部补跑把不存在的页写进产物、或把整篇文档当成本次完成页数。
+        """
+        text = str(raw or "").strip()
+        if not text or text.casefold() in {"全量", "全部", "all", "*"}:
+            return list(range(1, total_pages + 1))
+        pages: set[int] = set()
+        for part in re.split(r"[,，;；\s]+", text):
+            part = part.replace("第", "").replace("页", "").strip()
+            if not part:
+                continue
+            match = re.fullmatch(r"(\d+)(?:\s*[-~—]\s*(\d+))?", part)
+            if not match:
+                raise ValueError(f"页码范围「{text}」无法解析，请使用 2-2 或 1-3,5 这样的格式")
+            start = int(match.group(1))
+            end = int(match.group(2) or start)
+            if start > end:
+                raise ValueError(f"页码范围「{text}」起点大于终点")
+            if start < 1:
+                raise ValueError(f"页码范围「{text}」页码不能小于 1")
+            # 终点超过实际页数时只截到真实末页，超出部分不计入本次完成页数
+            pages.update(range(start, min(end, total_pages) + 1))
+        if not pages:
+            raise ValueError(f"页码范围「{text}」未落在文档实际页数 1-{total_pages} 内")
+        return sorted(pages)
+
+    @staticmethod
+    def _merge_records_by_page(
+        existing: list[dict[str, Any]],
+        updates: list[dict[str, Any]],
+        replace_pages: set[int],
+        *,
+        page_key: str = "page_num",
+        single_per_page: bool = False,
+    ) -> list[dict[str, Any]]:
+        """按页合并记录：本次范围内的页用新记录替换，范围外的页沿用历史记录。
+
+        历史产物可能因为旧的追加写出现同页多条，single_per_page=True 时按页只保留
+        最后一条可核对记录，避免旧页面在补跑后继续重复堆积。
+        """
+        def page_of(record: dict[str, Any]) -> int | None:
+            try:
+                return int(record.get(page_key))
+            except (TypeError, ValueError):
+                return None
+
+        if single_per_page:
+            by_page: dict[int, dict[str, Any]] = {}
+            for record in existing:
+                page = page_of(record)
+                if page is not None:
+                    by_page[page] = record
+            for record in updates:
+                page = page_of(record)
+                if page is not None:
+                    by_page[page] = record
+            return [by_page[page] for page in sorted(by_page)]
+
+        kept = [record for record in existing if page_of(record) not in replace_pages]
+        return sorted(kept + updates, key=lambda record: (page_of(record) or 0, str(record.get("bbox", ""))))
+
+    def _page_group_path(self, doc_id: str) -> Path:
+        """解析页组清单路径：每篇文档一份，记录各页由哪一次解析生成。"""
+        return self._data_dir("page_groups") / f"{doc_id}.json"
+
+    def _read_page_group(self, doc_id: str) -> dict[str, Any] | None:
+        """读取解析页组清单，不存在说明该文档还没有可核对的页组。"""
+        return self._read_json(self._page_group_path(doc_id))
 
     def _compute_checksum(self, content: str) -> str:
         """计算内容SHA256校验值（取前16位），用于文件完整性比对和版本校验。"""
@@ -241,11 +351,17 @@ class BaseModuleService:
         except Exception as e:
             return {"auto_trigger": "kg_build", "relation_set_id": relation_set_id, "error": str(e)}
 
-    def _trigger_layout_restore(self, doc_id: str) -> dict[str, Any]:
-        """解析完成后自动触发版式还原，恢复段落层级和表格图片区域边界。"""
+    def _trigger_layout_restore(self, doc_id: str, *, page_group: dict[str, Any] | None = None) -> dict[str, Any]:
+        """解析完成后自动触发版式还原，恢复段落层级和表格图片区域边界。
+
+        page_group 是本轮解析按范围确认的页组；传入时版式还原只处理这些变动页，
+        未传时保持原来的整篇还原行为。
+        """
         try:
             cls = self._safe_import("app.services.layout_restore", "LayoutRestoreService")
-            return cls().restore_from_document(doc_id)
+            if page_group is None:
+                return cls().restore_from_document(doc_id)
+            return cls().restore_from_document(doc_id, page_group=page_group)
         except Exception as e:
             return {"auto_trigger": "layout_restore", "doc_id": doc_id, "error": str(e)}
 

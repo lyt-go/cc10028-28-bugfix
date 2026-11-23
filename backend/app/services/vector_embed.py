@@ -59,7 +59,8 @@ class VectorEmbedService(BaseModuleService):
             })
 
         output_path = self._data_dir("vectors") / f"{chunk_set_id}_vectors.jsonl"
-        written = self._write_jsonl(output_path, vectors)
+        # 向量产物按整篇重算，整体替换避免重复补跑把同一批记录追加成多份
+        written = self._replace_jsonl(output_path, vectors)
 
         self._write_checkpoint(f"vector_{chunk_set_id}", {
             "chunk_set_id": chunk_set_id,
